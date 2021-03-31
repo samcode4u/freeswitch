@@ -23,6 +23,9 @@
     <!-- delay between retries in seconds, default is 5 seconds -->
     <!-- <param name="delay" value="1"/> -->
 
+    <!-- compress cdr before sending, default is zip -->
+    <!-- <param name="compress" value="zip"/> -->
+
     <!-- Log via http and on disk, default is false -->
     <!-- <param name="log-http-and-disk" value="true"/> -->
 

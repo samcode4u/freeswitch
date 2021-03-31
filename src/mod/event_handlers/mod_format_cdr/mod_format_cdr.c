@@ -33,6 +33,8 @@
 #include <switch.h>
 #include <sys/stat.h>
 #include <switch_curl.h>
+#include <zlib.h>
+
 #define MAX_URLS 20
 #define MAX_ERR_DIRS 20
 
@@ -57,6 +59,8 @@ struct cdr_profile {
 	char *urls[MAX_URLS + 1];
 	int url_count;
 	int url_index;
+	z_stream strm;
+	char *compress;
 	switch_thread_rwlock_t *log_path_lock;
 	char *base_log_dir;
 	char *base_err_log_dir[MAX_ERR_DIRS];
@@ -193,6 +197,36 @@ static switch_status_t set_format_cdr_log_dirs(cdr_profile_t *profile)
 
 	return status;
 }
+
+
+#define CHUNK 0x4000
+
+#define CALL_ZLIB(x)                                            \
+    {                                                           \
+        int status;                                             \
+        status = x;                                             \
+        if (status < 0)                                         \
+        {                                                       \
+            fprintf(stderr,                                     \
+                    "%s:%d: %s returned a bad status of %d.\n", \
+                    __FILE__, __LINE__, #x, status);            \
+            exit(EXIT_FAILURE);                                 \
+        }                                                       \
+    }
+
+#define windowBits 15
+#define GZIP_ENCODING 16
+
+static void strm_init(z_stream *strm)
+{
+    strm->zalloc = Z_NULL;
+    strm->zfree = Z_NULL;
+    strm->opaque = Z_NULL;
+    CALL_ZLIB(deflateInit2(strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                           windowBits | GZIP_ENCODING, 8,
+                           Z_DEFAULT_STRATEGY));
+}
+
 
 static switch_status_t my_on_reporting_cb(switch_core_session_t *session, cdr_profile_t *profile)
 {
@@ -346,10 +380,34 @@ static switch_status_t my_on_reporting_cb(switch_core_session_t *session, cdr_pr
 			switch_curl_easy_setopt(curl_handle, CURLOPT_USERPWD, profile->cred);
 		}
 
+		if (!zstr(profile->compress)){
+			int have;
+			unsigned char out[CHUNK];
+			profile->strm.next_in = (unsigned char *)curl_cdr_text;
+			profile->strm.avail_in = strlen(curl_cdr_text);
+			do
+			{
+				profile->strm.avail_out = CHUNK;
+				profile->strm.next_out = out;
+				CALL_ZLIB(deflate(&profile->strm, Z_FINISH));
+				have = CHUNK - profile->strm.avail_out;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "\noriginallength=%lu compressedlength=%d\n", strlen(curl_cdr_text), have);
+			} while (profile->strm.avail_out == 0);
+
+			deflateEnd(&profile->strm);
+
+			headers = switch_curl_slist_append(headers, "Content-Encoding: gzip");
+            switch_curl_easy_setopt(curl_handle, CURLOPT_ENCODING, "gzip");
+            switch_curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, out);
+            switch_curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDSIZE, have);
+		}else {
+			switch_curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, curl_cdr_text);
+		}
+
 		switch_curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
 		switch_curl_easy_setopt(curl_handle, CURLOPT_POST, 1);
 		switch_curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1);
-		switch_curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, curl_cdr_text);
+
 		switch_curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "freeswitch-format-cdr/1.0");
 		switch_curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, httpCallBack);
 
@@ -693,6 +751,9 @@ switch_status_t mod_format_cdr_load_profile_xml(switch_xml_t xprofile)
 				}
 			} else if (!strcasecmp(var, "encode-values") && !zstr(val)) {
 				profile->encode_values = switch_true(val) ? ENCODING_DEFAULT : ENCODING_NONE;
+			} else if (!strcasecmp(var, "compress") && !zstr(val)) {
+				profile->compress = switch_core_strdup(profile->pool, val);
+				strm_init(&profile->strm);
 			}
 		}
 
